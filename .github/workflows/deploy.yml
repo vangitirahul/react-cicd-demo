@@ -8,15 +8,35 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Validate required secrets
+        run: |
+          missing_secrets=()
+          [ -z "${{ secrets.AWS_REGION }}" ] && missing_secrets+=("AWS_REGION")
+          [ -z "${{ secrets.S3_BUCKET_NAME }}" ] && missing_secrets+=("S3_BUCKET_NAME")
+          [ -z "${{ secrets.EC2_INSTANCE_ID }}" ] && missing_secrets+=("EC2_INSTANCE_ID")
+          [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && missing_secrets+=("AWS_ACCESS_KEY_ID")
+          [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && missing_secrets+=("AWS_SECRET_ACCESS_KEY")
+          
+          if [ ${#missing_secrets[@]} -gt 0 ]; then
+            echo "Error: Missing required repository secrets:"
+            printf '%s\n' "${missing_secrets[@]}"
+            exit 1
+          fi
+          echo "All required secrets are configured."
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '22.x'
 
       - name: Install dependencies
         run: npm install
@@ -40,19 +60,19 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Upload dist.zip to S3
-        run: aws s3 cp dist.zip s3://${{ secrets.S3_BUCKET_NAME }}/dist.zip
+        run: aws s3 cp dist.zip s3://${{ env.S3_BUCKET_NAME }}/dist.zip
 
       - name: Deploy application via AWS Systems Manager
         run: |
           set -e
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
             --comment "React Vite deployment" \
             --parameters commands='[
               "mkdir -p /tmp/react-deploy",
               "cd /tmp/react-deploy",
-              "aws s3 cp s3://${{ secrets.S3_BUCKET_NAME }}/dist.zip .",
+              "aws s3 cp s3://${{ env.S3_BUCKET_NAME }}/dist.zip .",
               "rm -rf dist",
               "unzip -o dist.zip -d dist",
               "sudo rm -rf /usr/share/nginx/html/*",
@@ -66,11 +86,11 @@ jobs:
 
           aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
+            --instance-id "${{ env.EC2_INSTANCE_ID }}"
 
           INVOCATION_STATUS=$(aws ssm list-command-invocations \
             --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
             --details \
             --query 'CommandInvocations[0].Status' \
             --output text)
@@ -79,7 +99,7 @@ jobs:
 
           aws ssm list-command-invocations \
             --command-id "$COMMAND_ID" \
-            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
             --details
 
           if [ "$INVOCATION_STATUS" != "Success" ]; then
