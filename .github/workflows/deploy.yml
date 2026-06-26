@@ -1,0 +1,74 @@
+name: React CI/CD Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build React App
+        run: npm run build
+
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Create Deployment Package
+        run: |
+          cd dist
+          zip -r ../dist.zip .
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload dist.zip to S3
+        run: |
+          aws s3 cp dist.zip s3://${{ secrets.S3_BUCKET_NAME }}/dist.zip
+
+      - name: Deploy to EC2 using SSM
+        uses: MercuryTechnologies/aws-ssm-send-command-action@v0
+        with:
+          document-name: AWS-RunShellScript
+
+          targets: >
+            [
+              {
+                "Key":"instanceids",
+                "Values":["${{ secrets.EC2_INSTANCE_ID }}"]
+              }
+            ]
+
+          parameters: >
+            {
+              "commands":[
+                "mkdir -p /tmp/react-deploy",
+                "cd /tmp/react-deploy",
+                "aws s3 cp s3://${{ secrets.S3_BUCKET_NAME }}/dist.zip .",
+                "rm -rf dist",
+                "unzip -o dist.zip -d dist",
+                "sudo rm -rf /usr/share/nginx/html/*",
+                "sudo cp -r dist/* /usr/share/nginx/html/",
+                "sudo systemctl reload nginx"
+              ]
+            }
+
+          wait-until-command-executed: true
+          max-wait-time: 600
