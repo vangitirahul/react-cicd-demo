@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -18,21 +18,21 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Dependencies
-        run: npm ci
+      - name: Install dependencies
+        run: npm install
 
-      - name: Build React App
+      - name: Build React app
         run: npm run build
 
       - name: Install zip
         run: sudo apt-get update && sudo apt-get install -y zip
 
-      - name: Create Deployment Package
+      - name: Package build artifacts
         run: |
           cd dist
           zip -r ../dist.zip .
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -40,35 +40,49 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Upload dist.zip to S3
+        run: aws s3 cp dist.zip s3://${{ secrets.S3_BUCKET_NAME }}/dist.zip
+
+      - name: Deploy application via AWS Systems Manager
         run: |
-          aws s3 cp dist.zip s3://${{ secrets.S3_BUCKET_NAME }}/dist.zip
+          set -e
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "React Vite deployment" \
+            --parameters commands='[
+              "mkdir -p /tmp/react-deploy",
+              "cd /tmp/react-deploy",
+              "aws s3 cp s3://${{ secrets.S3_BUCKET_NAME }}/dist.zip .",
+              "rm -rf dist",
+              "unzip -o dist.zip -d dist",
+              "sudo rm -rf /usr/share/nginx/html/*",
+              "sudo cp -r dist/* /usr/share/nginx/html/",
+              "sudo systemctl reload nginx"
+            ]' \
+            --output text \
+            --query 'Command.CommandId')
 
-      - name: Deploy to EC2 using SSM
-        uses: MercuryTechnologies/aws-ssm-send-command-action@v0
-        with:
-          document-name: AWS-RunShellScript
+          echo "SSM Command ID: $COMMAND_ID"
 
-          targets: >
-            [
-              {
-                "Key":"instanceids",
-                "Values":["${{ secrets.EC2_INSTANCE_ID }}"]
-              }
-            ]
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
 
-          parameters: >
-            {
-              "commands":[
-                "mkdir -p /tmp/react-deploy",
-                "cd /tmp/react-deploy",
-                "aws s3 cp s3://${{ secrets.S3_BUCKET_NAME }}/dist.zip .",
-                "rm -rf dist",
-                "unzip -o dist.zip -d dist",
-                "sudo rm -rf /usr/share/nginx/html/*",
-                "sudo cp -r dist/* /usr/share/nginx/html/",
-                "sudo systemctl reload nginx"
-              ]
-            }
+          INVOCATION_STATUS=$(aws ssm list-command-invocations \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --details \
+            --query 'CommandInvocations[0].Status' \
+            --output text)
 
-          wait-until-command-executed: true
-          max-wait-time: 600
+          echo "SSM invocation status: $INVOCATION_STATUS"
+
+          aws ssm list-command-invocations \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --details
+
+          if [ "$INVOCATION_STATUS" != "Success" ]; then
+            echo "Deployment failed with status: $INVOCATION_STATUS"
+            exit 1
+          fi
