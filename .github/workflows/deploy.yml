@@ -1,4 +1,4 @@
-name: React CI/CD Deployment
+name: Docker CI/CD Deployment
 
 on:
   push:
@@ -8,101 +8,45 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
-      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
 
     steps:
-      - name: Checkout repository
+      # Step 1 - Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Validate required secrets
-        run: |
-          missing_secrets=()
-          [ -z "${{ secrets.AWS_REGION }}" ] && missing_secrets+=("AWS_REGION")
-          [ -z "${{ secrets.S3_BUCKET_NAME }}" ] && missing_secrets+=("S3_BUCKET_NAME")
-          [ -z "${{ secrets.EC2_INSTANCE_ID }}" ] && missing_secrets+=("EC2_INSTANCE_ID")
-          [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && missing_secrets+=("AWS_ACCESS_KEY_ID")
-          [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && missing_secrets+=("AWS_SECRET_ACCESS_KEY")
-          
-          if [ ${#missing_secrets[@]} -gt 0 ]; then
-            echo "Error: Missing required repository secrets:"
-            printf '%s\n' "${missing_secrets[@]}"
-            exit 1
-          fi
-          echo "All required secrets are configured."
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      # Step 2 - Login to Docker Hub
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
         with:
-          node-version: '22.x'
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Install dependencies
-        run: npm install
-
-      - name: Build React app
-        run: npm run build
-
-      - name: Install zip
-        run: sudo apt-get update && sudo apt-get install -y zip
-
-      - name: Package build artifacts
+      # Step 3 - Build Docker Image
+      - name: Build Docker Image
         run: |
-          cd dist
-          zip -r ../dist.zip .
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/react-cicd-demo:latest .
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      # Step 4 - Push Image to Docker Hub
+      - name: Push Docker Image
+        run: |
+          docker push ${{ secrets.DOCKER_USERNAME }}/react-cicd-demo:latest
+
+      # Step 5 - Deploy to EC2
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.2.0
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
 
-      - name: Upload dist.zip to S3
-        run: aws s3 cp dist.zip s3://${{ env.S3_BUCKET_NAME }}/dist.zip
+          script: |
+            docker pull ${{ secrets.DOCKER_USERNAME }}/react-cicd-demo:latest
 
-      - name: Deploy application via AWS Systems Manager
-        run: |
-          set -e
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "React Vite deployment" \
-            --parameters commands='[
-              "mkdir -p /tmp/react-deploy",
-              "cd /tmp/react-deploy",
-              "aws s3 cp s3://${{ env.S3_BUCKET_NAME }}/dist.zip .",
-              "rm -rf dist",
-              "unzip -o dist.zip -d dist",
-              "sudo rm -rf /usr/share/nginx/html/*",
-              "sudo cp -r dist/* /usr/share/nginx/html/",
-              "sudo systemctl reload nginx"
-            ]' \
-            --output text \
-            --query 'Command.CommandId')
+            docker stop react-app || true
 
-          echo "SSM Command ID: $COMMAND_ID"
+            docker rm react-app || true
 
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ env.EC2_INSTANCE_ID }}"
-
-          INVOCATION_STATUS=$(aws ssm list-command-invocations \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
-            --details \
-            --query 'CommandInvocations[0].Status' \
-            --output text)
-
-          echo "SSM invocation status: $INVOCATION_STATUS"
-
-          aws ssm list-command-invocations \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
-            --details
-
-          if [ "$INVOCATION_STATUS" != "Success" ]; then
-            echo "Deployment failed with status: $INVOCATION_STATUS"
-            exit 1
-          fi
+            docker run -d \
+              --name react-app \
+              -p 80:80 \
+              ${{ secrets.DOCKER_USERNAME }}/react-cicd-demo:latest
